@@ -22,7 +22,7 @@ This project uses a Makefile for a simple, automated build process.
     Clone the repository:
 
     git clone NN_library
-    cd [your-repo-name]
+    cd NN_library
 
     Build the executable:
 
