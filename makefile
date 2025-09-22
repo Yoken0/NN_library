@@ -23,7 +23,7 @@ run: all
 # Clean up build artifacts
 
 clean:
-rm -f $(TARGET)
-rm -f *.o
+	rm -f $(TARGET)
+	rm -f *.o
 
 .PHONY: all run clean

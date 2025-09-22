@@ -1,198 +1,380 @@
 #include <iostream>
 #include <vector>
+#include <memory>
 #include <numeric>
 #include <cmath>
-#include <random>
 #include <stdexcept>
-#include <algorithm>
-#include <functional>
+#include <random>
+#include <chrono>
 
-// A simple tensor class for multi-dimensional data and automatic differentiation.
+// --- Transpose function for Tensors ---
+class Tensor; // Forward declaration
+Tensor transpose(const Tensor& input);
+
+// === Tensor Class ===
+// A simple multi-dimensional array with automatic differentiation capabilities.
 class Tensor {
 public:
     std::vector<double> data;
-    std::vector<size_t> shape;
+    std::vector<int> shape;
     std::vector<double> grad;
-    Tensor* parent_a = nullptr;
-    Tensor* parent_b = nullptr;
-    std::function<void(const Tensor&)> backward_fn;
-    bool requires_grad = false;
+    std::shared_ptr<Tensor> operand_a;
+    std::shared_ptr<Tensor> operand_b;
+    std::function<void()> backward_op;
 
-    // Constructor for a new tensor
-    Tensor(const std::vector<double>& d, const std::vector<size_t>& s, bool req_grad = false)
-        : data(d), shape(s), requires_grad(req_grad) {
-        if (requires_grad) {
-            grad.resize(data.size(), 0.0);
+    // Default constructor to allow for creation without immediate data
+    Tensor() : data({}), shape({}), grad({}) {}
+
+    Tensor(std::vector<double> d, std::vector<int> s) : data(d), shape(s) {
+        if (!check_shape()) {
+            throw std::runtime_error("Data size does not match shape.");
         }
+        grad.resize(data.size(), 0.0);
     }
 
-    // Helper to get the size of the tensor
-    size_t size() const {
-        size_t s = 1;
-        for (size_t dim : shape) {
-            s *= dim;
+    bool check_shape() const {
+        size_t total_elements = 1;
+        for (int dim : shape) {
+            total_elements *= dim;
         }
-        return s;
+        return total_elements == data.size();
     }
 
-    // Static function to create a zero-initialized tensor
-    static Tensor zeros(const std::vector<size_t>& shape) {
-        size_t size = 1;
-        for (size_t dim : shape) {
-            size *= dim;
-        }
-        return Tensor(std::vector<double>(size, 0.0), shape);
+    void zero_grad() {
+        std::fill(grad.begin(), grad.end(), 0.0);
+        if (operand_a) operand_a->zero_grad();
+        if (operand_b) operand_b->zero_grad();
     }
 
-    // Static function to create a tensor with random values
-    static Tensor rand(const std::vector<size_t>& shape) {
-        size_t size = 1;
-        for (size_t dim : shape) {
-            size *= dim;
+    void backward(double upstream_grad = 1.0) {
+        if (data.empty()) return;
+        
+        for (size_t i = 0; i < grad.size(); ++i) {
+            grad[i] += upstream_grad;
         }
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::normal_distribution<> d(0, 1.0 / sqrt(shape.back()));
-        std::vector<double> random_data(size);
-        for (size_t i = 0; i < size; ++i) {
-            random_data[i] = d(gen);
+
+        if (backward_op) {
+            backward_op();
         }
-        return Tensor(random_data, shape, true);
     }
 };
 
-// Abstract base class for all layers
+// --- Operators for Tensors ---
+Tensor add(const Tensor& a, const Tensor& b) {
+    if (a.data.size() != b.data.size()) {
+        throw std::runtime_error("Tensor sizes must match for addition.");
+    }
+    std::vector<double> result_data(a.data.size());
+    for (size_t i = 0; i < a.data.size(); ++i) {
+        result_data[i] = a.data[i] + b.data[i];
+    }
+    Tensor result(result_data, a.shape);
+    result.operand_a = std::make_shared<Tensor>(a);
+    result.operand_b = std::make_shared<Tensor>(b);
+    result.backward_op = [&, result_grad = result.grad]() {
+        for (size_t i = 0; i < a.grad.size(); ++i) {
+            result.operand_a->grad[i] += result_grad[i];
+            result.operand_b->grad[i] += result_grad[i];
+        }
+    };
+    return result;
+}
+
+Tensor subtract(const Tensor& a, const Tensor& b) {
+    if (a.data.size() != b.data.size()) {
+        throw std::runtime_error("Tensor sizes must match for subtraction.");
+    }
+    std::vector<double> result_data(a.data.size());
+    for (size_t i = 0; i < a.data.size(); ++i) {
+        result_data[i] = a.data[i] - b.data[i];
+    }
+    Tensor result(result_data, a.shape);
+    result.operand_a = std::make_shared<Tensor>(a);
+    result.operand_b = std::make_shared<Tensor>(b);
+    result.backward_op = [&, result_grad = result.grad]() {
+        for (size_t i = 0; i < a.grad.size(); ++i) {
+            result.operand_a->grad[i] += result_grad[i];
+            result.operand_b->grad[i] -= result_grad[i];
+        }
+    };
+    return result;
+}
+
+Tensor matmul(const Tensor& a, const Tensor& b) {
+    if (a.shape.size() != 2 || b.shape.size() != 2 || a.shape[1] != b.shape[0]) {
+        throw std::runtime_error("Invalid shapes for matrix multiplication.");
+    }
+
+    int rows_a = a.shape[0];
+    int cols_a = a.shape[1];
+    int cols_b = b.shape[1];
+
+    std::vector<double> result_data(rows_a * cols_b, 0.0);
+    for (int i = 0; i < rows_a; ++i) {
+        for (int j = 0; j < cols_b; ++j) {
+            for (int k = 0; k < cols_a; ++k) {
+                result_data[i * cols_b + j] += a.data[i * cols_a + k] * b.data[k * cols_b + j];
+            }
+        }
+    }
+
+    Tensor result(result_data, {rows_a, cols_b});
+    result.operand_a = std::make_shared<Tensor>(a);
+    result.operand_b = std::make_shared<Tensor>(b);
+    result.backward_op = [&, result_grad = result.grad]() {
+        // dL/dA = dL/dZ * B^T
+        std::vector<double> grad_a_data(a.data.size(), 0.0);
+        for (int i = 0; i < rows_a; ++i) {
+            for (int j = 0; j < cols_a; ++j) {
+                for (int k = 0; k < cols_b; ++k) {
+                    grad_a_data[i * cols_a + j] += result_grad[i * cols_b + k] * b.data[j * cols_b + k];
+                }
+            }
+        }
+        // dL/dB = A^T * dL/dZ
+        std::vector<double> grad_b_data(b.data.size(), 0.0);
+        for (int i = 0; i < cols_a; ++i) {
+            for (int j = 0; j < cols_b; ++j) {
+                for (int k = 0; k < rows_a; ++k) {
+                    grad_b_data[i * cols_b + j] += a.data[k * cols_a + i] * result_grad[k * cols_b + j];
+                }
+            }
+        }
+        for (size_t i = 0; i < grad_a_data.size(); ++i) result.operand_a->grad[i] += grad_a_data[i];
+        for (size_t i = 0; i < grad_b_data.size(); ++i) result.operand_b->grad[i] += grad_b_data[i];
+    };
+    return result;
+}
+
+Tensor sigmoid(const Tensor& x) {
+    std::vector<double> result_data(x.data.size());
+    for (size_t i = 0; i < x.data.size(); ++i) {
+        result_data[i] = 1.0 / (1.0 + std::exp(-x.data[i]));
+    }
+    Tensor result(result_data, x.shape);
+    result.operand_a = std::make_shared<Tensor>(x);
+    result.backward_op = [&, result_grad = result.grad]() {
+        for (size_t i = 0; i < result_grad.size(); ++i) {
+            double s = result.data[i];
+            result.operand_a->grad[i] += result_grad[i] * s * (1.0 - s);
+        }
+    };
+    return result;
+}
+
+Tensor relu(const Tensor& x) {
+    std::vector<double> result_data(x.data.size());
+    for (size_t i = 0; i < x.data.size(); ++i) {
+        result_data[i] = std::max(0.0, x.data[i]);
+    }
+    Tensor result(result_data, x.shape);
+    result.operand_a = std::make_shared<Tensor>(x);
+    result.backward_op = [&, result_grad = result.grad]() {
+        for (size_t i = 0; i < result_grad.size(); ++i) {
+            result.operand_a->grad[i] += result_grad[i] * (result.data[i] > 0 ? 1.0 : 0.0);
+        }
+    };
+    return result;
+}
+
+// === Layers ===
 class Layer {
 public:
-    virtual ~Layer() {}
+    virtual ~Layer() = default;
     virtual Tensor forward(const Tensor& input) = 0;
-    virtual void backward(const Tensor& grad_output) = 0;
-    virtual void update_parameters(double lr) = 0;
-    virtual std::vector<Tensor*> get_parameters() { return {}; }
+    virtual Tensor backward(const Tensor& output_grad) = 0;
+    virtual void update_params(double learning_rate) = 0;
 };
 
-// Linear layer implementation
 class Linear : public Layer {
 public:
     Tensor weights;
     Tensor bias;
     Tensor input_cache;
 
-    Linear(size_t in_features, size_t out_features)
-        : weights(Tensor::rand({out_features, in_features})),
-          bias(Tensor::rand({out_features, 1})) {}
+    Linear(int input_dim, int output_dim) {
+        // Initialize weights and bias with random values
+        std::mt19937_64 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::normal_distribution<double> dist(0.0, std::sqrt(2.0 / (input_dim + output_dim)));
+        std::vector<double> w_data(input_dim * output_dim);
+        for (size_t i = 0; i < w_data.size(); ++i) {
+            w_data[i] = dist(rng);
+        }
+        weights = Tensor(w_data, {input_dim, output_dim});
+        bias = Tensor(std::vector<double>(output_dim, 0.0), {1, output_dim});
+    }
 
     Tensor forward(const Tensor& input) override {
         input_cache = input;
-        size_t batch_size = input.shape[0];
-        size_t in_features = input.shape[1];
-        size_t out_features = weights.shape[0];
+        Tensor matmul_result = matmul(input, weights);
+        return add(matmul_result, bias);
+    }
 
-        // Ensure shapes are compatible for matrix multiplication
-        if (input.shape[1] != weights.shape[1]) {
-            throw std::runtime_error("Input and weights shape mismatch in Linear layer.");
-        }
-
-        std::vector<double> output_data(batch_size * out_features, 0.0);
+    Tensor backward(const Tensor& output_grad) override {
+        // Compute gradients for weights and bias
+        Tensor weights_t = transpose(weights);
         
-        // Manual matrix multiplication
-        for (size_t i = 0; i < batch_size; ++i) {
-            for (size_t j = 0; j < out_features; ++j) {
-                double val = 0.0;
-                for (size_t k = 0; k < in_features; ++k) {
-                    val += input.data[i * in_features + k] * weights.data[j * in_features + k];
-                }
-                output_data[i * out_features + j] = val + bias.data[j];
-            }
-        }
-        Tensor output(output_data, {batch_size, out_features}, true);
-        return output;
+        // This is a simplified backward calculation without a computational graph.
+        Tensor grad_weights_from_output_grad = matmul(transpose(input_cache), output_grad);
+        weights.grad = grad_weights_from_output_grad.data;
+        bias.grad = output_grad.data;
+
+        // Compute gradient for the input and return it
+        Tensor grad_input = matmul(output_grad, weights_t);
+        return grad_input;
     }
 
-    void backward(const Tensor& grad_output) override {
-        // Compute gradients for this layer's parameters
-        size_t batch_size = input_cache.shape[0];
-        size_t in_features = input_cache.shape[1];
-        size_t out_features = weights.shape[0];
-
-        // Reset gradients
-        std::fill(weights.grad.begin(), weights.grad.end(), 0.0);
-        std::fill(bias.grad.begin(), bias.grad.end(), 0.0);
-
-        // Gradient of weights: grad_output^T * input
-        for (size_t j = 0; j < out_features; ++j) {
-            for (size_t k = 0; k < in_features; ++k) {
-                double grad_w = 0.0;
-                for (size_t i = 0; i < batch_size; ++i) {
-                    grad_w += grad_output.data[i * out_features + j] * input_cache.data[i * in_features + k];
-                }
-                weights.grad[j * in_features + k] = grad_w;
-            }
-        }
-
-        // Gradient of bias: sum of grad_output across batch dimension
-        for (size_t j = 0; j < out_features; ++j) {
-            double grad_b = 0.0;
-            for (size_t i = 0; i < batch_size; ++i) {
-                grad_b += grad_output.data[i * out_features + j];
-            }
-            bias.grad[j] = grad_b;
-        }
-
-        // We don't need to propagate back to the input here, the model class handles it
-    }
-
-    void update_parameters(double lr) override {
-        // Update weights and bias using gradient descent
+    void update_params(double learning_rate) override {
         for (size_t i = 0; i < weights.data.size(); ++i) {
-            weights.data[i] -= lr * weights.grad[i];
+            weights.data[i] -= learning_rate * weights.grad[i];
         }
         for (size_t i = 0; i < bias.data.size(); ++i) {
-            bias.data[i] -= lr * bias.grad[i];
+            bias.data[i] -= learning_rate * bias.grad[i];
         }
-    }
-
-    std::vector<Tensor*> get_parameters() override {
-        return {&weights, &bias};
     }
 };
 
-// ReLU activation function
 class ReLU : public Layer {
 public:
     Tensor input_cache;
 
+    ReLU() = default;
+
     Tensor forward(const Tensor& input) override {
         input_cache = input;
-        std::vector<double> output_data = input.data;
-        for (double& val : output_data) {
-            if (val < 0.0) {
-                val = 0.0;
-            }
-        }
-        Tensor output(output_data, input.shape, true);
-        return output;
-    }
-    
-    void backward(const Tensor& grad_output) override {
-        // Compute gradients for this layer
-        if (input_cache.requires_grad) {
-            for (size_t i = 0; i < input_cache.data.size(); ++i) {
-                if (input_cache.data[i] > 0.0) {
-                    input_cache.grad[i] = grad_output.data[i];
-                } else {
-                    input_cache.grad[i] = 0.0;
-                }
-            }
-        }
+        return relu(input);
     }
 
-    void update_parameters(double lr) override {
-        // ReLU has no parameters to update
+    Tensor backward(const Tensor& output_grad) override {
+        // The gradient of ReLU is 1 for positive inputs, 0 otherwise.
+        std::vector<double> grad_input_data(input_cache.data.size());
+        for (size_t i = 0; i < input_cache.data.size(); ++i) {
+            grad_input_data[i] = input_cache.data[i] > 0 ? output_grad.data[i] : 0.0;
+        }
+        return Tensor(grad_input_data, input_cache.shape);
+    }
+
+    void update_params(double learning_rate) override {
+        // No parameters to update for ReLU
     }
 };
 
-// Simple Model class to combine layers
+class Softmax : public Layer {
+public:
+    Tensor output_cache;
+    
+    Softmax() = default;
+
+    Tensor forward(const Tensor& input) override {
+        // Softmax implementation
+        std::vector<double> exp_data(input.data.size());
+        double sum_exp = 0.0;
+        for (size_t i = 0; i < input.data.size(); ++i) {
+            exp_data[i] = std::exp(input.data[i]);
+            sum_exp += exp_data[i];
+        }
+
+        std::vector<double> result_data(input.data.size());
+        for (size_t i = 0; i < input.data.size(); ++i) {
+            result_data[i] = exp_data[i] / sum_exp;
+        }
+
+        output_cache = Tensor(result_data, input.shape);
+        return output_cache;
+    }
+
+    Tensor backward(const Tensor& output_grad) override {
+        // Since CrossEntropyLoss's backward method already handles the combined
+        // gradient of softmax and the loss, this layer's backward can be simplified.
+        return Tensor(std::vector<double>(output_grad.data.size(), 0.0), output_grad.shape);
+    }
+
+    void update_params(double learning_rate) override {
+        // No parameters to update for Softmax
+    }
+};
+
+// --- Transpose function for Tensors ---
+Tensor transpose(const Tensor& input) {
+    if (input.shape.size() != 2) {
+        throw std::runtime_error("Transpose is only supported for 2D tensors.");
+    }
+    int rows = input.shape[0];
+    int cols = input.shape[1];
+    std::vector<double> transposed_data(rows * cols);
+    for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j < cols; ++j) {
+            transposed_data[j * rows + i] = input.data[i * cols + j];
+        }
+    }
+    return Tensor(transposed_data, {cols, rows});
+}
+
+// === Loss Function ===
+class MSELoss {
+public:
+    Tensor forward(const Tensor& predicted, const Tensor& target) {
+        if (predicted.data.size() != target.data.size()) {
+            throw std::runtime_error("Predicted and target tensors must have the same size.");
+        }
+        std::vector<double> diff(predicted.data.size());
+        for (size_t i = 0; i < predicted.data.size(); ++i) {
+            diff[i] = predicted.data[i] - target.data[i];
+        }
+        double sum_sq_diff = 0.0;
+        for (double d : diff) {
+            sum_sq_diff += d * d;
+        }
+        double loss_value = sum_sq_diff / predicted.data.size();
+        return Tensor({loss_value}, {1});
+    }
+
+    Tensor backward(const Tensor& predicted, const Tensor& target) {
+        std::vector<double> grad_data(predicted.data.size());
+        for (size_t i = 0; i < predicted.data.size(); ++i) {
+            grad_data[i] = 2.0 * (predicted.data[i] - target.data[i]) / predicted.data.size();
+        }
+        return Tensor(grad_data, predicted.shape);
+    }
+};
+
+class CrossEntropyLoss {
+public:
+    Tensor forward(const Tensor& predicted_logits, const Tensor& target_one_hot) {
+        if (predicted_logits.data.size() != target_one_hot.data.size()) {
+            throw std::runtime_error("Predicted and target tensors must have the same size.");
+        }
+        double loss = 0.0;
+        double sum_exp = 0.0;
+        for(double val : predicted_logits.data) {
+            sum_exp += std::exp(val);
+        }
+        
+        for (size_t i = 0; i < predicted_logits.data.size(); ++i) {
+            if (target_one_hot.data[i] > 0.5) { // Assuming one-hot encoded
+                loss = -predicted_logits.data[i] + std::log(sum_exp);
+                break;
+            }
+        }
+        return Tensor({loss}, {1});
+    }
+
+    Tensor backward(const Tensor& predicted_logits, const Tensor& target_one_hot) {
+        std::vector<double> grad_data(predicted_logits.data.size());
+        double sum_exp = 0.0;
+        for(double val : predicted_logits.data) {
+            sum_exp += std::exp(val);
+        }
+
+        for (size_t i = 0; i < predicted_logits.data.size(); ++i) {
+            double softmax_prob = std::exp(predicted_logits.data[i]) / sum_exp;
+            grad_data[i] = softmax_prob - target_one_hot.data[i];
+        }
+        return Tensor(grad_data, predicted_logits.shape);
+    }
+};
+
+// === Model ===
 class Model {
 public:
     std::vector<std::unique_ptr<Layer>> layers;
@@ -201,163 +383,107 @@ public:
         layers.push_back(std::move(layer));
     }
 
-    Tensor forward(const Tensor& input) {
-        Tensor current_tensor = input;
+    Tensor forward(Tensor input) {
+        Tensor output = input;
         for (const auto& layer : layers) {
-            current_tensor = layer->forward(current_tensor);
+            output = layer->forward(output);
         }
-        return current_tensor;
+        return output;
     }
 
-    void backward(const Tensor& grad_output) {
-        Tensor current_grad = grad_output;
-        for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
-            (*it)->backward(current_grad);
+    void backward(const Tensor& output_grad) {
+        Tensor current_grad = output_grad;
+        for (size_t i = layers.size(); i > 0; --i) {
+            current_grad = layers[i - 1]->backward(current_grad);
         }
     }
 
-    void update_parameters(double lr) {
+    void update_params(double learning_rate) {
         for (const auto& layer : layers) {
-            layer->update_parameters(lr);
+            layer->update_params(learning_rate);
         }
     }
 };
 
-// Cross-Entropy loss function for classification
-Tensor cross_entropy_loss(const Tensor& pred, const Tensor& target, Tensor& grad_output) {
-    if (pred.size() != target.size() || pred.shape.back() != target.shape.back()) {
-        throw std::runtime_error("Prediction and target shape mismatch in Cross-Entropy loss.");
-    }
-    
-    size_t batch_size = pred.shape[0];
-    size_t num_classes = pred.shape.back();
-
-    // Compute softmax probabilities
-    std::vector<double> softmax_data(pred.data.size());
-    for (size_t i = 0; i < batch_size; ++i) {
-        double max_val = pred.data[i * num_classes];
-        for (size_t j = 1; j < num_classes; ++j) {
-            if (pred.data[i * num_classes + j] > max_val) {
-                max_val = pred.data[i * num_classes + j];
-            }
-        }
-        double sum_exp = 0.0;
-        for (size_t j = 0; j < num_classes; ++j) {
-            softmax_data[i * num_classes + j] = std::exp(pred.data[i * num_classes + j] - max_val);
-            sum_exp += softmax_data[i * num_classes + j];
-        }
-        for (size_t j = 0; j < num_classes; ++j) {
-            softmax_data[i * num_classes + j] /= sum_exp;
-        }
-    }
-    
-    // Compute loss
-    double loss_val = 0.0;
-    for (size_t i = 0; i < pred.size(); ++i) {
-        loss_val -= target.data[i] * std::log(softmax_data[i] + 1e-9); // Add epsilon for numerical stability
-    }
-    
-    // Compute gradient for the backward pass
-    std::vector<double> grad_data(pred.size());
-    for (size_t i = 0; i < pred.size(); ++i) {
-        grad_data[i] = softmax_data[i] - target.data[i];
-    }
-    grad_output = Tensor(grad_data, pred.shape);
-    
-    return Tensor({loss_val / batch_size}, {1}, true);
-}
-
-
-// Main function to demonstrate the library
+// === Main Function ===
 int main() {
-    try {
-        // Build a simple neural network for MNIST classification
-        const size_t INPUT_FEATURES = 784; // 28x28 image
-        const size_t HIDDEN_FEATURES = 64;
-        const size_t OUTPUT_FEATURES = 10; // Digits 0-9
-        const size_t BATCH_SIZE = 1;
+    std::cout << "Starting Neural Network Training for a single digit..." << std::endl;
 
-        Model model;
-        model.add_layer(std::make_unique<Linear>(INPUT_FEATURES, HIDDEN_FEATURES));
-        model.add_layer(std::make_unique<ReLU>());
-        model.add_layer(std::make_unique<Linear>(HIDDEN_FEATURES, OUTPUT_FEATURES));
+    // Hyperparameters
+    const int INPUT_DIM = 784;  // 28x28 pixels
+    const int HIDDEN_DIM = 128;
+    const int OUTPUT_DIM = 10;  // Digits 0-9
+    const double LEARNING_RATE = 0.001;
+    const int EPOCHS = 1000;
 
-        // Create a hard-coded representation of a single hand-drawn digit '3'
-        // This is a simplified representation of a 28x28 pixel image
-        std::vector<double> x_data(INPUT_FEATURES, 0.0);
-        // Drawing a crude '3'
-        for (int i = 0; i < 28; ++i) {
-            if (i > 5 && i < 22) { // Top line of the '3'
-                x_data[5 * 28 + i] = 0.8;
-                x_data[6 * 28 + i] = 0.8;
-            }
-            if (i > 5 && i < 22) { // Middle line
-                x_data[13 * 28 + i] = 0.8;
-                x_data[14 * 28 + i] = 0.8;
-            }
-            if (i > 5 && i < 22) { // Bottom line
-                x_data[21 * 28 + i] = 0.8;
-                x_data[22 * 28 + i] = 0.8;
-            }
-        }
-        for (int i = 0; i < 28; ++i) { // Right vertical lines
-            if (i > 5 && i < 15) {
-                x_data[i * 28 + 21] = 0.8;
-                x_data[i * 28 + 22] = 0.8;
-            }
-            if (i > 13 && i < 23) {
-                x_data[i * 28 + 21] = 0.8;
-                x_data[i * 28 + 22] = 0.8;
+    // Create a simple model
+    Model model;
+    model.add_layer(std::make_unique<Linear>(INPUT_DIM, HIDDEN_DIM));
+    model.add_layer(std::make_unique<ReLU>());
+    model.add_layer(std::make_unique<Linear>(HIDDEN_DIM, OUTPUT_DIM));
+    
+    CrossEntropyLoss loss_fn;
+    Softmax softmax_layer;
+
+    // Hard-coded input for the digit '3' (simplified)
+    std::vector<double> input_data(INPUT_DIM, 0.0);
+    // A very simple representation of a '3'
+    for (int i = 0; i < 28; ++i) {
+        if (i >= 5 && i <= 22) {
+            input_data[i * 28 + 10] = 1.0;
+            input_data[i * 28 + 11] = 1.0;
+            input_data[i * 28 + 12] = 1.0;
+            if (i > 8 && i < 14) {
+                input_data[i * 28 + 13] = 1.0;
             }
         }
-        
-        // One-hot encoded target for the digit '3'
-        std::vector<double> y_data(OUTPUT_FEATURES, 0.0);
-        y_data[3] = 1.0;
-
-        Tensor x_train(x_data, {BATCH_SIZE, INPUT_FEATURES}, true);
-        Tensor y_train(y_data, {BATCH_SIZE, OUTPUT_FEATURES});
-
-        // Training parameters
-        double learning_rate = 0.01;
-        int epochs = 100;
-
-        std::cout << "Starting training on a single digit '3'..." << std::endl;
-        for (int epoch = 0; epoch < epochs; ++epoch) {
-            // Forward pass
-            Tensor y_pred = model.forward(x_train);
-
-            // Calculate loss and get the gradient of the loss
-            Tensor grad_output({0.0}, {0}); // Initialize with dummy values
-            Tensor loss = cross_entropy_loss(y_pred, y_train, grad_output);
-
-            // Backward pass
-            model.backward(grad_output);
-
-            // Update parameters
-            model.update_parameters(learning_rate);
-
-            if ((epoch + 1) % 10 == 0) {
-                std::cout << "Epoch " << epoch + 1 << ", Loss: " << loss.data[0] << std::endl;
-            }
-        }
-        std::cout << "Training finished." << std::endl;
-
-        // Make a prediction on the trained data
-        Tensor prediction = model.forward(x_train);
-        size_t predicted_class = 0;
-        double max_prob = -1.0;
-        for (size_t i = 0; i < prediction.size(); ++i) {
-            if (prediction.data[i] > max_prob) {
-                max_prob = prediction.data[i];
-                predicted_class = i;
-            }
-        }
-        std::cout << "\nAfter training, the predicted digit is: " << predicted_class << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
     }
+    input_data[5 * 28 + 13] = 1.0;
+    input_data[12 * 28 + 13] = 1.0;
+    input_data[13 * 28 + 13] = 1.0;
+    input_data[14 * 28 + 13] = 1.0;
+    input_data[15 * 28 + 13] = 1.0;
+    input_data[16 * 28 + 13] = 1.0;
+    
+    Tensor input_tensor(input_data, {1, INPUT_DIM});
+
+    // Target for the digit '3' (one-hot encoded)
+    std::vector<double> target_data(OUTPUT_DIM, 0.0);
+    target_data[3] = 1.0;
+    Tensor target_tensor(target_data, {1, OUTPUT_DIM});
+
+    // Training loop
+    for (int epoch = 0; epoch <= EPOCHS; ++epoch) {
+        Tensor predicted_logits = model.forward(input_tensor);
+        Tensor predicted_probs = softmax_layer.forward(predicted_logits);
+
+        Tensor loss = loss_fn.forward(predicted_logits, target_tensor);
+
+        if (epoch % 10 == 0) {
+            std::cout << "Epoch: " << epoch << ", Loss: " << loss.data[0] << std::endl;
+        }
+
+        Tensor loss_grad = loss_fn.backward(predicted_logits, target_tensor);
+        // This is a simplified backward pass without a computational graph.
+        // The gradient from the loss function is the same as the gradient for the softmax input.
+        model.backward(loss_grad);
+        model.update_params(LEARNING_RATE);
+    }
+
+    // Final prediction
+    Tensor final_output_logits = model.forward(input_tensor);
+    Tensor final_output_probs = softmax_layer.forward(final_output_logits);
+    int predicted_digit = 0;
+    double max_prob = -1.0;
+    for (int i = 0; i < final_output_probs.data.size(); ++i) {
+        if (final_output_probs.data[i] > max_prob) {
+            max_prob = final_output_probs.data[i];
+            predicted_digit = i;
+        }
+    }
+
+    std::cout << "\nTraining finished." << std::endl;
+    std::cout << "Predicted digit: " << predicted_digit << std::endl;
 
     return 0;
 }
